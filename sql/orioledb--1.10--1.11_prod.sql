@@ -5,3 +5,6 @@
 
 -- Maintenance entry point, like verify_orioledb() revoked in 1.8.
 REVOKE ALL ON FUNCTION orioledb_tbl_check(oid, boolean) FROM PUBLIC;
+
+-- Walks every page of any given table, like orioledb_tbl_check().
+REVOKE ALL ON FUNCTION orioledb_tbl_compression_check(int8, oid, integer[]) FROM PUBLIC;

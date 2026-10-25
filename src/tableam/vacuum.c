@@ -1264,6 +1264,7 @@ orioledb_vacuum_bridged_indexes(Relation rel, OTableDescr *descr,
 	BufferUsage startbufferusage = pgBufferUsage;
 	BlockNumber orig_rel_pages,
 				new_rel_pages;
+	bool		parallel_vacuum;
 	OIndexDescr *bridge;
 	ErrorContextCallback errcallback;
 
@@ -1395,8 +1396,37 @@ orioledb_vacuum_bridged_indexes(Relation rel, OTableDescr *descr,
 	 * Free resources managed by dead_items_alloc.  This ends parallel mode in
 	 * passing when necessary.
 	 */
+	parallel_vacuum = ParallelVacuumIsActive(vacrel);
 	dead_items_cleanup(vacrel);
 	Assert(!IsInParallelMode());
+
+	/*
+	 * Parallel mode has ended: perform the pg_class update
+	 * orioledb_amvacuumcleanup() deferred.
+	 */
+	if (parallel_vacuum && vacrel->do_index_cleanup)
+	{
+		for (int idx = 0; idx < vacrel->nindexes; idx++)
+		{
+			if (vacrel->indrels[idx]->rd_index->indisprimary)
+			{
+				BlockNumber curpages = RelationGetNumberOfBlocks(rel);
+
+				vac_update_relstats(rel,
+									curpages,
+									vacrel->new_rel_tuples,
+									curpages,
+#if PG_VERSION_NUM >= 180000
+									0,
+#endif
+									true,
+									InvalidTransactionId,
+									InvalidMultiXactId,
+									NULL, NULL, false);
+				break;
+			}
+		}
+	}
 
 	/*
 	 * Update pg_class entries for each of rel's indexes where appropriate.

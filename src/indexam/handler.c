@@ -1169,7 +1169,12 @@ orioledb_amvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	stats->num_index_tuples = info->num_heap_tuples;
 	stats->estimated_count = info->estimated_count;
 
-	if (info->index->rd_index->indisprimary)
+	/*
+	 * In-place catalog updates are prohibited in parallel mode, and
+	 * amvacuumcleanup() runs in it; defer the update to
+	 * orioledb_vacuum_bridged_indexes() then.
+	 */
+	if (info->index->rd_index->indisprimary && !IsInParallelMode())
 	{
 		BlockNumber curpages = RelationGetNumberOfBlocks(info->heaprel);
 

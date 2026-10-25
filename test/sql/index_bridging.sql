@@ -1462,6 +1462,15 @@ SET enable_seqscan = off;
 SELECT id FROM o_bridge_ioc_dropped WHERE message_id = 2;
 RESET enable_seqscan;
 
+-- parallel VACUUM used to fail here: pg_class update from inside
+-- parallel mode
+CREATE TABLE o_bridging_parallel_vacuum_test (i bigint PRIMARY KEY, v bigint NOT NULL) USING orioledb WITH (autovacuum_enabled = false);
+CREATE INDEX o_bridging_parallel_vacuum_test_hash_idx ON o_bridging_parallel_vacuum_test USING hash (v);
+INSERT INTO o_bridging_parallel_vacuum_test SELECT g, g FROM generate_series(1, 50000) g;
+VACUUM o_bridging_parallel_vacuum_test;
+VACUUM (PARALLEL 0) o_bridging_parallel_vacuum_test;
+DROP TABLE o_bridging_parallel_vacuum_test;
+
 DROP EXTENSION pageinspect;
 DROP EXTENSION orioledb CASCADE;
 DROP SCHEMA index_bridging CASCADE;

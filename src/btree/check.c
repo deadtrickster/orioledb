@@ -27,6 +27,7 @@
 #include "utils/memdebug.h"
 #include "utils/page_pool.h"
 #include "utils/seq_buf.h"
+#include "utils/stopevent.h"
 #include "utils/ucm.h"
 
 #include "pgstat.h"
@@ -658,16 +659,59 @@ add_extent(ExtentsArray *arr, FileExtent extent)
 	arr->blocksCount += extent.len;
 }
 
+/*
+ * Lock again the non-leaf page this walk frame is on, and point loc at the
+ * downlink whose subtree ends at the given key.
+ *
+ * The page was unlocked meanwhile, so its slot may hold another page by now,
+ * and even when it does not, a merge may have deleted downlinks from it
+ * without changing its change count.  Only a search by key finds the right
+ * place in both cases.
+ */
+static void
+check_refind_page(BTreeCheckStatus *status, OFixedKey *key,
+				  BTreeKeyType keyType, uint16 level, OInMemoryBlkno *blkno,
+				  uint32 *pageChangeCount, BTreePageItemLocator *loc)
+{
+	OBTreeFindPageContext *context = &status->context;
+	OFindPageResult result PG_USED_FOR_ASSERTS_ONLY;
+	uint16		saved_flags = context->flags;
+
+	BTREE_PAGE_FIND_SET(context, DOWNLINK_LOCATION);
+	result = refind_page(context,
+						 keyType == BTreeKeyRightmost ? NULL : (Pointer) &key->tuple,
+						 keyType, level, *blkno, *pageChangeCount);
+	context->flags = saved_flags;
+	Assert(result == OFindPageResultSuccess);
+
+	*blkno = context->items[context->index].blkno;
+	*pageChangeCount = context->items[context->index].pageChangeCount;
+	*loc = context->items[context->index].locator;
+}
+
+/*
+ * Walk the B-tree down from the given page, adding every visited page's
+ * file extent to status->busy.  The caller holds the lock on parentPagenum,
+ * which is released once this page is locked.  Returns with no page locked,
+ * so the caller refinds its own page rather than relocking a slot that may
+ * have been reused.
+ *
+ * Single-page eviction takes no relation lock, so whenever this page is
+ * unlocked (to walk a child, to wait for a downlink IO, or in load_page())
+ * it can be evicted or merged into.  The position is therefore kept as the
+ * key the current downlink's subtree ends at.
+ */
 static void
 check_walk_btree(BTreeCheckStatus *status, OInMemoryBlkno blkno,
 				 OInMemoryBlkno parentPagenum)
 {
 	Page		p = O_GET_IN_MEMORY_PAGE(blkno);
 	BTreePageHeader *header = (BTreePageHeader *) p;
-	OrioleDBPageDesc *page_desc = O_GET_IN_MEMORY_PAGEDESC(blkno);
 	OBTreeFindPageContext *context = &status->context;
-	FileExtent	extent;
+	OrioleDBPageDesc *page_desc;
 	uint64		rightLink;
+	uint32		pageChangeCount;
+	uint16		level;
 
 	Assert(OInMemoryBlknoIsValid(blkno));
 
@@ -676,15 +720,19 @@ check_walk_btree(BTreeCheckStatus *status, OInMemoryBlkno blkno,
 		unlock_page(parentPagenum);
 
 	context->index++;
+	pageChangeCount = O_PAGE_GET_CHANGE_COUNT(p);
 	context->items[context->index].blkno = blkno;
-	context->items[context->index].pageChangeCount = O_PAGE_GET_CHANGE_COUNT(p);
+	context->items[context->index].pageChangeCount = pageChangeCount;
+	level = PAGE_GET_LEVEL(p);
 
 	rightLink = header->rightLink;
 	if (RightLinkIsValid(rightLink))
 	{
 		Page		rightP = O_GET_IN_MEMORY_PAGE(RIGHTLINK_GET_BLKNO(rightLink));
 
-		if (O_PAGE_IS(rightP, BROKEN_SPLIT) && status->emit_transient_notices)
+		/* An evicted local-pool slot is NULL. */
+		if (rightP != NULL && O_PAGE_IS(rightP, BROKEN_SPLIT) &&
+			status->emit_transient_notices)
 		{
 			elog(NOTICE, "BTree has a broken split.");
 			status->hasError = true;
@@ -694,41 +742,112 @@ check_walk_btree(BTreeCheckStatus *status, OInMemoryBlkno blkno,
 	if (!O_PAGE_IS(p, LEAF))
 	{
 		BTreePageItemLocator loc;
+		BTreePageItemLocator nextLoc;
+		OFixedKey	itemKey;
+		BTreeKeyType itemKeyType;
 
 		BTREE_PAGE_LOCATOR_FIRST(p, &loc);
 		while (BTREE_PAGE_LOCATOR_IS_VALID(p, &loc))
 		{
-			Pointer		ptr = BTREE_PAGE_LOCATOR_GET_ITEM(p, &loc);
-			BTreeNonLeafTuphdr *tuphdr = (BTreeNonLeafTuphdr *) ptr;
+			BTreeNonLeafTuphdr *tuphdr;
+			bool		walked;
+
+			nextLoc = loc;
+			BTREE_PAGE_LOCATOR_NEXT(p, &nextLoc);
+			if (BTREE_PAGE_LOCATOR_IS_VALID(p, &nextLoc))
+			{
+				copy_fixed_page_key(status->desc, &itemKey, p, &nextLoc);
+				itemKeyType = BTreeKeyPageHiKey;
+			}
+			else if (!O_PAGE_IS(p, RIGHTMOST))
+			{
+				copy_fixed_hikey(status->desc, &itemKey, p);
+				itemKeyType = BTreeKeyPageHiKey;
+			}
+			else
+			{
+				clear_fixed_key(&itemKey);
+				itemKeyType = BTreeKeyRightmost;
+			}
+
+			tuphdr = (BTreeNonLeafTuphdr *) BTREE_PAGE_LOCATOR_GET_ITEM(p, &loc);
 
 			if (DOWNLINK_IS_IN_MEMORY(tuphdr->downlink))
 			{
-				check_walk_btree(status, DOWNLINK_GET_IN_MEMORY_BLKNO(tuphdr->downlink),
+				check_walk_btree(status,
+								 DOWNLINK_GET_IN_MEMORY_BLKNO(tuphdr->downlink),
 								 blkno);
+				walked = true;
 			}
 			else if (DOWNLINK_IS_IN_IO(tuphdr->downlink))
 			{
-				wait_for_io_completion(DOWNLINK_GET_IO_LOCKNUM(tuphdr->downlink));
-				continue;
+				int			ionum = DOWNLINK_GET_IO_LOCKNUM(tuphdr->downlink);
+
+				/*
+				 * Whoever runs the IO locks this page to update the downlink
+				 * before completing it, so waiting under the lock deadlocks.
+				 */
+				unlock_page(blkno);
+				wait_for_io_completion(ionum);
+				walked = false;
 			}
 			else if (DOWNLINK_IS_ON_DISK(tuphdr->downlink))
 			{
+				context->items[context->index].blkno = blkno;
+				context->items[context->index].pageChangeCount = pageChangeCount;
 				context->items[context->index].locator = loc;
 				load_page(context);
+
+				/* load_page() refinds this page by key, maybe at another slot. */
+				blkno = context->items[context->index].blkno;
+				pageChangeCount = context->items[context->index].pageChangeCount;
+				loc = context->items[context->index].locator;
+				p = O_GET_IN_MEMORY_PAGE(blkno);
 				continue;
 			}
-			BTREE_PAGE_LOCATOR_NEXT(p, &loc);
+			else
+			{
+				BTREE_PAGE_LOCATOR_NEXT(p, &loc);
+				continue;
+			}
+
+			/*
+			 * The page is unlocked here.  Tests park here to evict or merge
+			 * into it before the refind.
+			 */
+			if (STOPEVENTS_ENABLED())
+			{
+				Jsonb	   *params;
+				JsonbParseState *state = NULL;
+
+				pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
+				btree_desc_stopevent_params_internal(status->desc, &state);
+				jsonb_push_int8_key(&state, "level", level);
+				jsonb_push_bool_key(&state, "walked", walked);
+				if (itemKeyType == BTreeKeyRightmost)
+					jsonb_push_null_key(&state, "key");
+				else
+				{
+					jsonb_push_key(&state, "key");
+					(void) o_btree_key_to_jsonb(status->desc, itemKey.tuple, &state);
+				}
+				params = JsonbValueToJsonb(pushJsonbValue(&state, WJB_END_OBJECT, NULL));
+
+				STOPEVENT(STOPEVENT_CHECK_WALK_REFIND, params);
+			}
+
+			check_refind_page(status, &itemKey, itemKeyType, level,
+							  &blkno, &pageChangeCount, &loc);
+			p = O_GET_IN_MEMORY_PAGE(blkno);
+			if (walked)
+				BTREE_PAGE_LOCATOR_NEXT(p, &loc);
 		}
 	}
 
+	page_desc = O_GET_IN_MEMORY_PAGEDESC(blkno);
 	if (FileExtentIsValid(page_desc->fileExtent))
-	{
-		extent = page_desc->fileExtent;
-		add_extent(&status->busy, extent);
-	}
+		add_extent(&status->busy, page_desc->fileExtent);
 
-	if (OInMemoryBlknoIsValid(parentPagenum))
-		lock_page(parentPagenum);
 	unlock_page(blkno);
 	context->index--;
 }

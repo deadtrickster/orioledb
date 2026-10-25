@@ -658,6 +658,15 @@ add_extent(ExtentsArray *arr, FileExtent extent)
 	arr->blocksCount += extent.len;
 }
 
+/*
+ * Walk the B-tree down from the given page, adding every visited page's
+ * file extent to status->busy.
+ *
+ * The page lock is dropped while entering a child, waiting for a downlink
+ * IO and load_page(), so the slot can be evicted and reused meanwhile:
+ * re-validate the incarnation after every relock and refind the page
+ * when it changed, like load_page() does for a parent.
+ */
 static void
 check_walk_btree(BTreeCheckStatus *status, OInMemoryBlkno blkno,
 				 OInMemoryBlkno parentPagenum)
@@ -668,6 +677,8 @@ check_walk_btree(BTreeCheckStatus *status, OInMemoryBlkno blkno,
 	OBTreeFindPageContext *context = &status->context;
 	FileExtent	extent;
 	uint64		rightLink;
+	uint32		pageChangeCount;
+	uint16		level;
 
 	Assert(OInMemoryBlknoIsValid(blkno));
 
@@ -677,14 +688,17 @@ check_walk_btree(BTreeCheckStatus *status, OInMemoryBlkno blkno,
 
 	context->index++;
 	context->items[context->index].blkno = blkno;
-	context->items[context->index].pageChangeCount = O_PAGE_GET_CHANGE_COUNT(p);
+	pageChangeCount = O_PAGE_GET_CHANGE_COUNT(p);
+	context->items[context->index].pageChangeCount = pageChangeCount;
+	level = PAGE_GET_LEVEL(p);
 
 	rightLink = header->rightLink;
 	if (RightLinkIsValid(rightLink))
 	{
 		Page		rightP = O_GET_IN_MEMORY_PAGE(RIGHTLINK_GET_BLKNO(rightLink));
 
-		if (O_PAGE_IS(rightP, BROKEN_SPLIT) && status->emit_transient_notices)
+		if (rightP != NULL && O_PAGE_IS(rightP, BROKEN_SPLIT) &&
+			status->emit_transient_notices)
 		{
 			elog(NOTICE, "BTree has a broken split.");
 			status->hasError = true;
@@ -694,12 +708,75 @@ check_walk_btree(BTreeCheckStatus *status, OInMemoryBlkno blkno,
 	if (!O_PAGE_IS(p, LEAF))
 	{
 		BTreePageItemLocator loc;
+		OFixedKey	resumeKey;
+		BTreeKeyType resumeKeyType;
+
+		clear_fixed_key(&resumeKey);
+		resumeKeyType = BTreeKeyPageHiKey;
 
 		BTREE_PAGE_LOCATOR_FIRST(p, &loc);
 		while (BTREE_PAGE_LOCATOR_IS_VALID(p, &loc))
 		{
-			Pointer		ptr = BTREE_PAGE_LOCATOR_GET_ITEM(p, &loc);
-			BTreeNonLeafTuphdr *tuphdr = (BTreeNonLeafTuphdr *) ptr;
+			Pointer		ptr;
+			BTreeNonLeafTuphdr *tuphdr;
+			BTreePageItemLocator nextLoc;
+			bool		itemProcessed = true;
+
+			if ((O_PAGE_IS_LOCAL(blkno) &&
+				 local_ppool_pages[blkno & O_BLKNO_MASK] == NULL) ||
+				O_PAGE_GET_CHANGE_COUNT(p) != pageChangeCount)
+			{
+				OFindPageResult findResult;
+				uint16		saved_flags = context->flags;
+
+				unlock_page(blkno);
+				BTREE_PAGE_FIND_SET(context, DOWNLINK_LOCATION);
+				findResult = refind_page(context,
+											 resumeKeyType == BTreeKeyRightmost ?
+											 NULL : (Pointer) &resumeKey.tuple,
+											 resumeKeyType, level, blkno,
+											 pageChangeCount);
+				context->flags = saved_flags;
+
+				if (findResult != OFindPageResultSuccess)
+				{
+					/* Unreachable without TRY_LOCK; relock to keep the frame balanced. */
+					lock_page(blkno);
+					break;
+				}
+
+				/* refind_page() positioned items[] at the saved child's downlink. */
+				blkno = context->items[context->index].blkno;
+				p = O_GET_IN_MEMORY_PAGE(blkno);
+				page_desc = O_GET_IN_MEMORY_PAGEDESC(blkno);
+				pageChangeCount = context->items[context->index].pageChangeCount;
+				loc = context->items[context->index].locator;
+				if (itemProcessed)
+					BTREE_PAGE_LOCATOR_NEXT(p, &loc);
+				continue;
+			}
+
+			/* Identifies this position if the page is evicted while the lock is dropped below. */
+			nextLoc = loc;
+			BTREE_PAGE_LOCATOR_NEXT(p, &nextLoc);
+			if (BTREE_PAGE_LOCATOR_IS_VALID(p, &nextLoc))
+			{
+				copy_fixed_page_key(status->desc, &resumeKey, p, &nextLoc);
+				resumeKeyType = BTreeKeyPageHiKey;
+			}
+			else if (!O_PAGE_IS(p, RIGHTMOST))
+			{
+				copy_fixed_hikey(status->desc, &resumeKey, p);
+				resumeKeyType = BTreeKeyPageHiKey;
+			}
+			else
+			{
+				clear_fixed_key(&resumeKey);
+				resumeKeyType = BTreeKeyRightmost;
+			}
+
+			ptr = BTREE_PAGE_LOCATOR_GET_ITEM(p, &loc);
+			tuphdr = (BTreeNonLeafTuphdr *) ptr;
 
 			if (DOWNLINK_IS_IN_MEMORY(tuphdr->downlink))
 			{
@@ -708,13 +785,32 @@ check_walk_btree(BTreeCheckStatus *status, OInMemoryBlkno blkno,
 			}
 			else if (DOWNLINK_IS_IN_IO(tuphdr->downlink))
 			{
-				wait_for_io_completion(DOWNLINK_GET_IO_LOCKNUM(tuphdr->downlink));
+				int		ionum = DOWNLINK_GET_IO_LOCKNUM(tuphdr->downlink);
+
+				/*
+				 * Waiting for IO under the page lock deadlocks: whoever
+				 * runs the IO takes this page's lock to flip the downlink
+				 * before completing it.
+				 */
+				unlock_page(blkno);
+				wait_for_io_completion(ionum);
+				lock_page(blkno);
+				itemProcessed = false;
 				continue;
 			}
 			else if (DOWNLINK_IS_ON_DISK(tuphdr->downlink))
 			{
+				context->items[context->index].blkno = blkno;
+				context->items[context->index].pageChangeCount = pageChangeCount;
 				context->items[context->index].locator = loc;
 				load_page(context);
+
+				/* load_page() may leave the page at another slot; take its re-stamped items[]. */
+				blkno = context->items[context->index].blkno;
+				p = O_GET_IN_MEMORY_PAGE(blkno);
+				page_desc = O_GET_IN_MEMORY_PAGEDESC(blkno);
+				pageChangeCount = context->items[context->index].pageChangeCount;
+				loc = context->items[context->index].locator;
 				continue;
 			}
 			BTREE_PAGE_LOCATOR_NEXT(p, &loc);

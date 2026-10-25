@@ -1333,8 +1333,9 @@ orioledb_tbl_check(PG_FUNCTION_ARGS)
 	orioledb_check_shmem();
 
 	/*
-	 * ExclusiveLock helps to avoid changes in map/tmp files and concurrent
-	 * eviction by bgwriter
+	 * AccessExclusiveLock keeps map/tmp files steady, but only whole-tree
+	 * eviction takes a relation lock (in try mode): single-page eviction
+	 * runs without one, so check_btree() must cope with pages going away.
 	 */
 	rel = relation_open(relid, AccessExclusiveLock);
 	descr = relation_get_descr(rel);

@@ -1357,6 +1357,27 @@ SELECT count(*), sum(a * 1000 + b) FROM o_bridge_pk2
 	WHERE tags @> ARRAY[3] OR (a, b) IN ((0, 5), (7, 10), (20, 40), (39, 49));
 DROP TABLE o_bridge_pk2;
 
+-- a BRIN bitmap is always lossy, so this exercises the lossy branch
+-- with a composite pk
+CREATE TABLE o_bridge_pk_brin (
+	i bigint NOT NULL,
+	j bigint NOT NULL,
+	v bigint NOT NULL,
+	PRIMARY KEY (i, j)
+) USING orioledb;
+INSERT INTO o_bridge_pk_brin
+	SELECT g / 50, g % 50, g * 3 FROM generate_series(1, 999) g;
+CREATE INDEX o_bridge_pk_brin_idx ON o_bridge_pk_brin USING brin (v);
+ANALYZE o_bridge_pk_brin;
+
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SELECT count(*), sum(v) FROM o_bridge_pk_brin WHERE v > 100;
+RESET enable_indexscan;
+RESET enable_seqscan;
+SELECT count(*), sum(v) FROM o_bridge_pk_brin WHERE v > 100;
+DROP TABLE o_bridge_pk_brin;
+
 -- Updates must maintain bridged expression indexes and enforce uniqueness.
 CREATE TABLE o_bridge_expr (
 	id int PRIMARY KEY,

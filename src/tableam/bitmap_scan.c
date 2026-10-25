@@ -2350,13 +2350,25 @@ bridge_next_page(OBitmapScan *scan, OBitmapHeapPlanState *bitmap_state)
 													 (Pointer) &end_bound,
 													 BTreeKeyBound, true,
 													 NULL);
-			uint64		data;
-
 			if (O_TUPLE_IS_NULL(tup))
 				break;
 
-			data = seconary_tuple_get_pk_data(tup, bridge);
-			o_keybitmap_insert(scan->arg.bitmap, data);
+			/* A fixed bitmap has no ->tree: encode the whole pk, like
+			 * the exact branch and o_index_getbitmap() do. */
+			if (o_keybitmap_pk_mode(GET_PRIMARY(scan->arg.tbl_desc),
+									NULL) == O_KEYBITMAP_FIXED)
+			{
+				uint8		key[OKBM_FIXED_BYTES];
+
+				o_pk_encode_leaf(tup, bridge, key);
+				o_keybitmap_insert_key(scan->arg.bitmap, key);
+			}
+			else
+			{
+				uint64		data = seconary_tuple_get_pk_data(tup, bridge);
+
+				o_keybitmap_insert(scan->arg.bitmap, data);
+			}
 			iter->page_ntuples++;
 
 			pfree(tup.data);

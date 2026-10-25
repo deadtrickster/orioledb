@@ -34,6 +34,12 @@
 #include "storage/latch.h"
 
 /*
+ * Attempts check_btree() makes while the page clock keeps writing the
+ * tree being checked (see check_btree()).
+ */
+#define CHECK_EXTENTS_ATTEMPTS 3
+
+/*
  * Dynamic array of file extents.
  */
 typedef struct
@@ -61,7 +67,8 @@ static int	file_extent_cmp(const void *p1, const void *p2);
 static void check_walk_btree(BTreeCheckStatus *status, OInMemoryBlkno blkno,
 							 OInMemoryBlkno parentPagenum);
 static void add_extent(ExtentsArray *arr, FileExtent extent);
-static bool check_extents(ExtentsArray *busy, ExtentsArray *free);
+static bool check_extents(ExtentsArray *busy, ExtentsArray *free,
+					   bool emit_notices);
 static void get_free_extents(BTreeDescr *desc, ExtentsArray *free_extents,
 							 bool force_file_check, uint32 chkp_num);
 static void get_free_extents_from_file(SeqBufTag *tag, off_t offset,
@@ -83,10 +90,12 @@ check_btree(BTreeDescr *desc, bool force_file_check, bool wait_for_checkpoint)
 	BTreeMetaPage *metaPageBlkno = BTREE_GET_META(desc);
 	BTreeCheckStatus status;
 	ExtentsArray free_extents;
-	uint64		data_file_len = pg_atomic_read_u64(&metaPageBlkno->datafileLength[0]);	/* Fix for S3 mode */
+	uint64		data_file_len;	/* Fix for S3 mode */
 	bool		is_compressed = OCompressIsValid(desc->compress);
 	uint32		checkpoint_number = 0;
 	bool		copy_blkno;
+	int			attempts;
+	bool		extents_ok;
 
 	memset(&status, 0, sizeof(BTreeCheckStatus));
 	memset(&free_extents, 0, sizeof(ExtentsArray));
@@ -101,7 +110,6 @@ check_btree(BTreeDescr *desc, bool force_file_check, bool wait_for_checkpoint)
 	 * on that transient.
 	 */
 	status.emit_transient_notices = !wait_for_checkpoint;
-	init_page_find_context(&status.context, desc, COMMITSEQNO_INPROGRESS, BTREE_PAGE_FIND_MODIFY);
 
 	/*
 	 * get_checkpoint_number() returns false while the checkpointer holds the
@@ -139,40 +147,85 @@ check_btree(BTreeDescr *desc, bool force_file_check, bool wait_for_checkpoint)
 
 	Assert(checkpoint_number > 0);
 
-	check_walk_btree(&status, desc->rootInfo.rootPageBlkno, OInvalidInMemoryBlkno);
-
-	if (status.hasError)
-		return false;
-
-	if (desc->storageType != BTreeStoragePersistence)
-		return true;
-
-	/* get free file extents */
-	get_free_extents(desc, &free_extents, force_file_check,
-					 checkpoint_number - 1);
-
-	if (status.hasError)
-		return false;
-
-	/* check extents */
-	status.hasError = !check_extents(&status.busy, &free_extents);
-
-	if (status.hasError)
-		return false;
-
-	if (data_file_len > status.busy.blocksCount + free_extents.blocksCount)
+	/*
+	 * The walk's own page loads drive the page clock, which writes the
+	 * tree's dirty pages -- and so grows the data file -- between the
+	 * three reads: whichever order they are taken in, a healthy tree
+	 * under eviction pressure can disagree in either direction, which
+	 * is what the false "Excess/Not used file blocks" reports were.
+	 *
+	 * The drift is bounded (the table lock excludes user writes), so
+	 * re-collect while the accounting keeps moving and report only once
+	 * it has settled; a corrupt tree never settles.
+	 */
+	for (attempts = 0;; attempts++)
 	{
-		elog(NOTICE, "Not used file blocks from " UINT64_FORMAT " to " UINT64_FORMAT,
-			 status.busy.blocksCount + free_extents.blocksCount,
-			 data_file_len);
-		status.hasError = true;
-	}
-	else if (data_file_len < status.busy.blocksCount + free_extents.blocksCount)
-	{
-		elog(NOTICE, "Excess file blocks from " UINT64_FORMAT " to " UINT64_FORMAT,
-			 data_file_len,
-			 status.busy.blocksCount + free_extents.blocksCount);
-		status.hasError = true;
+		init_page_find_context(&status.context, desc, COMMITSEQNO_INPROGRESS,
+							   BTREE_PAGE_FIND_MODIFY);
+
+		check_walk_btree(&status, desc->rootInfo.rootPageBlkno,
+						 OInvalidInMemoryBlkno);
+
+		if (status.hasError)
+			return false;
+
+		if (desc->storageType != BTreeStoragePersistence)
+			return true;
+
+		/* the length, like the sets below, is read after the walk */
+		data_file_len = pg_atomic_read_u64(&metaPageBlkno->datafileLength[0]);
+
+		/* get free file extents */
+		get_free_extents(desc, &free_extents, force_file_check,
+						 checkpoint_number - 1);
+
+		if (status.hasError)
+			return false;
+
+		/* check extents */
+		extents_ok = check_extents(&status.busy, &free_extents,
+								  attempts >= CHECK_EXTENTS_ATTEMPTS);
+
+		if (extents_ok &&
+			data_file_len == status.busy.blocksCount + free_extents.blocksCount)
+		{
+			/* the accounting agreed */
+			break;
+		}
+
+		if (attempts >= CHECK_EXTENTS_ATTEMPTS)
+		{
+			if (extents_ok &&
+				data_file_len > status.busy.blocksCount + free_extents.blocksCount)
+			{
+				elog(NOTICE, "Not used file blocks from " UINT64_FORMAT " to " UINT64_FORMAT,
+					 status.busy.blocksCount + free_extents.blocksCount,
+					 data_file_len);
+			}
+			else if (extents_ok)
+			{
+				elog(NOTICE, "Excess file blocks from " UINT64_FORMAT " to " UINT64_FORMAT,
+					 data_file_len,
+					 status.busy.blocksCount + free_extents.blocksCount);
+			}
+			/* check_extents() has said the rest already */
+			status.hasError = true;
+			break;
+		}
+
+		/* discard this attempt's extents and collect them again */
+		if (status.busy.size > 0)
+		{
+			Assert(status.busy.extents != NULL);
+			pfree(status.busy.extents);
+		}
+		if (free_extents.size > 0)
+		{
+			Assert(free_extents.extents != NULL);
+			pfree(free_extents.extents);
+		}
+		memset(&status.busy, 0, sizeof(ExtentsArray));
+		memset(&free_extents, 0, sizeof(ExtentsArray));
 	}
 
 	/* frees allocated bytes */
@@ -485,10 +538,11 @@ get_free_extents_from_seqbuf_pending(SeqBufDescPrivate *seqBuf,
 
 /*
  * Returns true if the busy and free extents array do not intersect and have no
- * holes.
+ * holes.  With emit_notices false the same verdict is reached silently, for
+ * the attempts check_btree() makes before it reports anything.
  */
 static bool
-check_extents(ExtentsArray *busy, ExtentsArray *free)
+check_extents(ExtentsArray *busy, ExtentsArray *free, bool emit_notices)
 {
 	FileExtent	cur;
 	uint64		b,
@@ -509,18 +563,20 @@ check_extents(ExtentsArray *busy, ExtentsArray *free)
 
 		while (b < busy->size && next_off > busy->extents[b].off)
 		{
-			elog(NOTICE, "Excess busy extent %lu %u",
-				 (unsigned long) busy->extents[b].off,
-				 (unsigned) busy->extents[b].len);
+			if (emit_notices)
+				elog(NOTICE, "Excess busy extent %lu %u",
+					 (unsigned long) busy->extents[b].off,
+					 (unsigned) busy->extents[b].len);
 			result = false;
 			b++;
 		}
 
 		while (f < free->size && next_off > free->extents[f].off)
 		{
-			elog(NOTICE, "Excess free extent %lu %u",
-				 (unsigned long) free->extents[f].off,
-				 (unsigned) free->extents[f].len);
+			if (emit_notices)
+				elog(NOTICE, "Excess free extent %lu %u",
+					 (unsigned long) free->extents[f].off,
+					 (unsigned) free->extents[f].len);
 			result = false;
 			f++;
 		}
@@ -532,9 +588,10 @@ check_extents(ExtentsArray *busy, ExtentsArray *free)
 		{
 			if (next_off != busy->extents[b].off)
 			{
-				elog(NOTICE, "Extent %lu %u is neither free or busy",
-					 (unsigned long) (next_off),
-					 (unsigned) (busy->extents[b].off - next_off));
+				if (emit_notices)
+					elog(NOTICE, "Extent %lu %u is neither free or busy",
+						 (unsigned long) (next_off),
+						 (unsigned) (busy->extents[b].off - next_off));
 				result = false;
 			}
 			cur = busy->extents[b++];
@@ -543,9 +600,10 @@ check_extents(ExtentsArray *busy, ExtentsArray *free)
 		{
 			if (next_off != free->extents[f].off)
 			{
-				elog(NOTICE, "Extent %lu %u is neither free or busy",
-					 (unsigned long) (next_off),
-					 (unsigned) (free->extents[f].off - next_off));
+				if (emit_notices)
+					elog(NOTICE, "Extent %lu %u is neither free or busy",
+						 (unsigned long) (next_off),
+						 (unsigned) (free->extents[f].off - next_off));
 				result = false;
 			}
 			cur = free->extents[f++];

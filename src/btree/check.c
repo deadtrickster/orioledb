@@ -49,18 +49,41 @@ typedef struct
 	uint64		blocksCount;
 } ExtentsArray;
 
+typedef struct BTreeWalk BTreeWalk;
+
+/*
+ * A walk over every page of a B-tree, which loads the on-disk ones.  Each
+ * page is visited after its subtree: visit_locked with the page locked, then
+ * visit_unlocked (if set) for work too slow to do under the page lock.
+ */
+struct BTreeWalk
+{
+	BTreeDescr *desc;
+	OBTreeFindPageContext context;
+	void		(*visit_locked) (BTreeWalk *walk, OInMemoryBlkno blkno);
+	void		(*visit_unlocked) (BTreeWalk *walk);
+};
+
 typedef struct
 {
+	BTreeWalk	walk;
 	ExtentsArray busy;
-	BTreeDescr *desc;
 	bool		hasError;
 	bool		emit_transient_notices;
-	OBTreeFindPageContext context;
 } BTreeCheckStatus;
 
+typedef struct
+{
+	BTreeWalk	walk;
+	BTreeCompressStats *stats;
+	OCompress	lvl;
+	char		img[ORIOLEDB_BLCKSZ];
+} BTreeCompressWalk;
+
 static int	file_extent_cmp(const void *p1, const void *p2);
-static void check_walk_btree(BTreeCheckStatus *status, OInMemoryBlkno blkno,
-							 OInMemoryBlkno parentPagenum);
+static void walk_btree(BTreeWalk *walk, OInMemoryBlkno blkno,
+					   OInMemoryBlkno parentPagenum);
+static void check_visit_page(BTreeWalk *walk, OInMemoryBlkno blkno);
 static void add_extent(ExtentsArray *arr, FileExtent extent);
 static bool check_extents(ExtentsArray *busy, ExtentsArray *free);
 static void get_free_extents(BTreeDescr *desc, ExtentsArray *free_extents,
@@ -93,7 +116,9 @@ check_btree(BTreeDescr *desc, bool force_file_check, bool wait_for_checkpoint)
 	memset(&free_extents, 0, sizeof(ExtentsArray));
 
 	/* get busy file extents */
-	status.desc = desc;
+	status.walk.desc = desc;
+	status.walk.visit_locked = check_visit_page;
+	status.walk.visit_unlocked = NULL;
 	status.hasError = false;
 
 	/*
@@ -102,7 +127,7 @@ check_btree(BTreeDescr *desc, bool force_file_check, bool wait_for_checkpoint)
 	 * on that transient.
 	 */
 	status.emit_transient_notices = !wait_for_checkpoint;
-	init_page_find_context(&status.context, desc, COMMITSEQNO_INPROGRESS, BTREE_PAGE_FIND_MODIFY);
+	init_page_find_context(&status.walk.context, desc, COMMITSEQNO_INPROGRESS, BTREE_PAGE_FIND_MODIFY);
 
 	/*
 	 * get_checkpoint_number() returns false while the checkpointer holds the
@@ -140,7 +165,7 @@ check_btree(BTreeDescr *desc, bool force_file_check, bool wait_for_checkpoint)
 
 	Assert(checkpoint_number > 0);
 
-	check_walk_btree(&status, desc->rootInfo.rootPageBlkno, OInvalidInMemoryBlkno);
+	walk_btree(&status.walk, desc->rootInfo.rootPageBlkno, OInvalidInMemoryBlkno);
 
 	if (status.hasError)
 		return false;
@@ -660,7 +685,7 @@ add_extent(ExtentsArray *arr, FileExtent extent)
 }
 
 /*
- * Lock again the non-leaf page this walk frame is on, and point loc at the
+ * Lock again the non-leaf page this walk_btree() frame is on, and point loc at the
  * downlink whose subtree ends at the given key.
  *
  * The page was unlocked meanwhile, so its slot may hold another page by now,
@@ -669,11 +694,11 @@ add_extent(ExtentsArray *arr, FileExtent extent)
  * place in both cases.
  */
 static void
-check_refind_page(BTreeCheckStatus *status, OFixedKey *key,
-				  BTreeKeyType keyType, uint16 level, OInMemoryBlkno *blkno,
-				  uint32 *pageChangeCount, BTreePageItemLocator *loc)
+walk_refind_page(BTreeWalk *walk, OFixedKey *key,
+				 BTreeKeyType keyType, uint16 level, OInMemoryBlkno *blkno,
+				 uint32 *pageChangeCount, BTreePageItemLocator *loc)
 {
-	OBTreeFindPageContext *context = &status->context;
+	OBTreeFindPageContext *context = &walk->context;
 	OFindPageResult result PG_USED_FOR_ASSERTS_ONLY;
 	uint16		saved_flags = context->flags;
 
@@ -690,11 +715,10 @@ check_refind_page(BTreeCheckStatus *status, OFixedKey *key,
 }
 
 /*
- * Walk the B-tree down from the given page, adding every visited page's
- * file extent to status->busy.  The caller holds the lock on parentPagenum,
- * which is released once this page is locked.  Returns with no page locked,
- * so the caller refinds its own page rather than relocking a slot that may
- * have been reused.
+ * Walk the B-tree down from the given page.  The caller holds the lock on
+ * parentPagenum, which is released once this page is locked.  Returns with
+ * no page locked, so the caller refinds its own page rather than relocking a
+ * slot that may have been reused.
  *
  * Single-page eviction takes no relation lock, so whenever this page is
  * unlocked (to walk a child, to wait for a downlink IO, or in load_page())
@@ -702,14 +726,10 @@ check_refind_page(BTreeCheckStatus *status, OFixedKey *key,
  * key the current downlink's subtree ends at.
  */
 static void
-check_walk_btree(BTreeCheckStatus *status, OInMemoryBlkno blkno,
-				 OInMemoryBlkno parentPagenum)
+walk_btree(BTreeWalk *walk, OInMemoryBlkno blkno, OInMemoryBlkno parentPagenum)
 {
 	Page		p = O_GET_IN_MEMORY_PAGE(blkno);
-	BTreePageHeader *header = (BTreePageHeader *) p;
-	OBTreeFindPageContext *context = &status->context;
-	OrioleDBPageDesc *page_desc;
-	uint64		rightLink;
+	OBTreeFindPageContext *context = &walk->context;
 	uint32		pageChangeCount;
 	uint16		level;
 
@@ -724,20 +744,6 @@ check_walk_btree(BTreeCheckStatus *status, OInMemoryBlkno blkno,
 	context->items[context->index].blkno = blkno;
 	context->items[context->index].pageChangeCount = pageChangeCount;
 	level = PAGE_GET_LEVEL(p);
-
-	rightLink = header->rightLink;
-	if (RightLinkIsValid(rightLink))
-	{
-		Page		rightP = O_GET_IN_MEMORY_PAGE(RIGHTLINK_GET_BLKNO(rightLink));
-
-		/* An evicted local-pool slot is NULL. */
-		if (rightP != NULL && O_PAGE_IS(rightP, BROKEN_SPLIT) &&
-			status->emit_transient_notices)
-		{
-			elog(NOTICE, "BTree has a broken split.");
-			status->hasError = true;
-		}
-	}
 
 	if (!O_PAGE_IS(p, LEAF))
 	{
@@ -756,12 +762,12 @@ check_walk_btree(BTreeCheckStatus *status, OInMemoryBlkno blkno,
 			BTREE_PAGE_LOCATOR_NEXT(p, &nextLoc);
 			if (BTREE_PAGE_LOCATOR_IS_VALID(p, &nextLoc))
 			{
-				copy_fixed_page_key(status->desc, &itemKey, p, &nextLoc);
+				copy_fixed_page_key(walk->desc, &itemKey, p, &nextLoc);
 				itemKeyType = BTreeKeyPageHiKey;
 			}
 			else if (!O_PAGE_IS(p, RIGHTMOST))
 			{
-				copy_fixed_hikey(status->desc, &itemKey, p);
+				copy_fixed_hikey(walk->desc, &itemKey, p);
 				itemKeyType = BTreeKeyPageHiKey;
 			}
 			else
@@ -774,9 +780,8 @@ check_walk_btree(BTreeCheckStatus *status, OInMemoryBlkno blkno,
 
 			if (DOWNLINK_IS_IN_MEMORY(tuphdr->downlink))
 			{
-				check_walk_btree(status,
-								 DOWNLINK_GET_IN_MEMORY_BLKNO(tuphdr->downlink),
-								 blkno);
+				walk_btree(walk, DOWNLINK_GET_IN_MEMORY_BLKNO(tuphdr->downlink),
+						   blkno);
 				walked = true;
 			}
 			else if (DOWNLINK_IS_IN_IO(tuphdr->downlink))
@@ -821,7 +826,7 @@ check_walk_btree(BTreeCheckStatus *status, OInMemoryBlkno blkno,
 				JsonbParseState *state = NULL;
 
 				pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
-				btree_desc_stopevent_params_internal(status->desc, &state);
+				btree_desc_stopevent_params_internal(walk->desc, &state);
 				jsonb_push_int8_key(&state, "level", level);
 				jsonb_push_bool_key(&state, "walked", walked);
 				if (itemKeyType == BTreeKeyRightmost)
@@ -829,81 +834,75 @@ check_walk_btree(BTreeCheckStatus *status, OInMemoryBlkno blkno,
 				else
 				{
 					jsonb_push_key(&state, "key");
-					(void) o_btree_key_to_jsonb(status->desc, itemKey.tuple, &state);
+					(void) o_btree_key_to_jsonb(walk->desc, itemKey.tuple, &state);
 				}
 				params = JsonbValueToJsonb(pushJsonbValue(&state, WJB_END_OBJECT, NULL));
 
 				STOPEVENT(STOPEVENT_CHECK_WALK_REFIND, params);
 			}
 
-			check_refind_page(status, &itemKey, itemKeyType, level,
-							  &blkno, &pageChangeCount, &loc);
+			walk_refind_page(walk, &itemKey, itemKeyType, level,
+							 &blkno, &pageChangeCount, &loc);
 			p = O_GET_IN_MEMORY_PAGE(blkno);
 			if (walked)
 				BTREE_PAGE_LOCATOR_NEXT(p, &loc);
 		}
 	}
 
-	page_desc = O_GET_IN_MEMORY_PAGEDESC(blkno);
-	if (FileExtentIsValid(page_desc->fileExtent))
-		add_extent(&status->busy, page_desc->fileExtent);
-
+	walk->visit_locked(walk, blkno);
 	unlock_page(blkno);
 	context->index--;
+
+	if (walk->visit_unlocked)
+		walk->visit_unlocked(walk);
 }
 
 static void
-btree_check_compression_recursive(BTreeDescr *desc, BTreeCompressStats *stats, OCompress lvl,
-								  OBTreeFindPageContext *context, OInMemoryBlkno blkno)
+check_visit_page(BTreeWalk *walk, OInMemoryBlkno blkno)
 {
-	char		buf[ORIOLEDB_BLCKSZ];
-	Page		p = O_GET_IN_MEMORY_PAGE(blkno);
-	size_t		compressed_size;
+	BTreeCheckStatus *status = (BTreeCheckStatus *) walk;
+	BTreePageHeader *header = (BTreePageHeader *) O_GET_IN_MEMORY_PAGE(blkno);
+	OrioleDBPageDesc *page_desc = O_GET_IN_MEMORY_PAGEDESC(blkno);
+	uint64		rightLink = header->rightLink;
 
-	ppool_ucm_inc_usage(desc->ppool, blkno);
-
-	context->index++;
-	context->items[context->index].blkno = blkno;
-	context->items[context->index].pageChangeCount = O_PAGE_GET_CHANGE_COUNT(p);
-
-	if (!O_PAGE_IS(p, LEAF))
+	if (RightLinkIsValid(rightLink))
 	{
-		BTreePageItemLocator loc;
+		Page		rightP = O_GET_IN_MEMORY_PAGE(RIGHTLINK_GET_BLKNO(rightLink));
 
-		BTREE_PAGE_LOCATOR_FIRST(p, &loc);
-		while (BTREE_PAGE_LOCATOR_IS_VALID(p, &loc))
+		/* An evicted local-pool slot is NULL. */
+		if (rightP != NULL && O_PAGE_IS(rightP, BROKEN_SPLIT) &&
+			status->emit_transient_notices)
 		{
-			Pointer		ptr = BTREE_PAGE_LOCATOR_GET_ITEM(p, &loc);
-			BTreeNonLeafTuphdr *tuphdr = (BTreeNonLeafTuphdr *) ptr;
-
-			if (DOWNLINK_IS_IN_MEMORY(tuphdr->downlink))
-			{
-				btree_check_compression_recursive(desc, stats, lvl, context,
-												  DOWNLINK_GET_IN_MEMORY_BLKNO(tuphdr->downlink));
-			}
-			else if (DOWNLINK_IS_IN_IO(tuphdr->downlink))
-			{
-				wait_for_io_completion(DOWNLINK_GET_IO_LOCKNUM(tuphdr->downlink));
-				continue;
-			}
-			else if (DOWNLINK_IS_ON_DISK(tuphdr->downlink))
-			{
-				context->items[context->index].locator = loc;
-				lock_page(blkno);
-				load_page(context);
-				unlock_page(blkno);
-				continue;
-			}
-			BTREE_PAGE_LOCATOR_NEXT(p, &loc);
+			elog(NOTICE, "BTree has a broken split.");
+			status->hasError = true;
 		}
 	}
 
-	memcpy(buf, p, ORIOLEDB_BLCKSZ);
-	VALGRIND_MAKE_MEM_DEFINED(buf, ORIOLEDB_BLCKSZ);
+	if (FileExtentIsValid(page_desc->fileExtent))
+		add_extent(&status->busy, page_desc->fileExtent);
+}
+
+static void
+compress_visit_page(BTreeWalk *walk, OInMemoryBlkno blkno)
+{
+	BTreeCompressWalk *cw = (BTreeCompressWalk *) walk;
+
+	ppool_ucm_inc_usage(walk->desc->ppool, blkno);
+	memcpy(cw->img, O_GET_IN_MEMORY_PAGE(blkno), ORIOLEDB_BLCKSZ);
+}
+
+static void
+compress_visit_unlocked(BTreeWalk *walk)
+{
+	BTreeCompressWalk *cw = (BTreeCompressWalk *) walk;
+	BTreeCompressStats *stats = cw->stats;
+	size_t		compressed_size;
+
+	VALGRIND_MAKE_MEM_DEFINED(cw->img, ORIOLEDB_BLCKSZ);
 
 	PG_TRY();
 	{
-		o_compress_page(buf, &compressed_size, lvl);
+		o_compress_page(cw->img, &compressed_size, cw->lvl);
 
 		stats->totalSize += ORIOLEDB_BLCKSZ;
 		stats->totalCompressedSize += compressed_size;
@@ -921,7 +920,7 @@ btree_check_compression_recursive(BTreeDescr *desc, BTreeCompressStats *stats, O
 				if (stats->ranges[i].from <= compressed_size
 					&& compressed_size <= stats->ranges[i].to)
 				{
-					if (O_PAGE_IS(p, LEAF))
+					if (O_PAGE_IS(cw->img, LEAF))
 						stats->ranges[i].leaf_count++;
 					else
 						stats->ranges[i].node_count++;
@@ -935,21 +934,25 @@ btree_check_compression_recursive(BTreeDescr *desc, BTreeCompressStats *stats, O
 		stats->errors++;
 	}
 	PG_END_TRY();
-
-	context->index--;
 }
 
 void
 check_btree_compression(BTreeDescr *desc, BTreeCompressStats *stats, OCompress lvl)
 {
-	OBTreeFindPageContext context;
+	BTreeCompressWalk cw;
 	bool		recovery = is_recovery_in_progress();
 
 	o_tables_rel_lock_extended(&desc->oids, AccessShareLock, recovery);
 	o_btree_load_shmem(desc);
-	init_page_find_context(&context, desc, COMMITSEQNO_INPROGRESS, BTREE_PAGE_FIND_MODIFY);
 
-	btree_check_compression_recursive(desc, stats, lvl, &context, desc->rootInfo.rootPageBlkno);
+	cw.walk.desc = desc;
+	init_page_find_context(&cw.walk.context, desc, COMMITSEQNO_INPROGRESS, BTREE_PAGE_FIND_MODIFY);
+	cw.walk.visit_locked = compress_visit_page;
+	cw.walk.visit_unlocked = compress_visit_unlocked;
+	cw.stats = stats;
+	cw.lvl = lvl;
+
+	walk_btree(&cw.walk, desc->rootInfo.rootPageBlkno, OInvalidInMemoryBlkno);
 
 	o_tables_rel_unlock_extended(&desc->oids, AccessShareLock, recovery);
 }

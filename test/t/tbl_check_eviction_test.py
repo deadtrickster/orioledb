@@ -16,9 +16,10 @@ WAIT_TIMEOUT = 60
 
 
 class TblCheckEvictionTest(BaseTest):
-	"""The B-tree walk of check_btree() must survive the tree changing.
+	"""The B-tree walk of the table checks must survive the tree changing.
 
-	check_walk_btree() unlocks the page it walks while it walks a child,
+	walk_btree(), which check_btree() and check_btree_compression() share,
+	unlocks the page it walks while it walks a child,
 	waits for a downlink IO or loads an on-disk child.  Single-page eviction
 	takes no relation lock, so meanwhile the page can be evicted and its
 	pool slot reused, or a merge of its children can delete downlinks from
@@ -26,7 +27,9 @@ class TblCheckEvictionTest(BaseTest):
 	stale page image and locator, reading garbage downlinks: a segfault on
 	release builds, Assert("blkno < orioledb_buffers_count") or PANIC
 	"error reading downlink" with cassert.  It also waited for downlink IO
-	with the page locked, a deadlock against whoever runs that IO.
+	with the page locked, a deadlock against whoever runs that IO.  The walk
+	of orioledb_tbl_compression_check() read pages without locking them at
+	all.
 
 	The 8MB tests are the reproducer from the report and only assert that
 	the server survives: the walk makes the page clock write dirty pages of
@@ -65,8 +68,10 @@ class TblCheckEvictionTest(BaseTest):
 				FROM generate_series(1, 2000) g;
 			DELETE FROM t1 WHERE i %% 2 = 0;
 		""" % indices_sql)
-		node.execute("SELECT orioledb_tbl_check('t0'::regclass);")
-		node.execute("SELECT orioledb_tbl_check('t1'::regclass);")
+		for check in ("orioledb_tbl_check(%s)",
+		              "orioledb_tbl_compression_check(5, %s)"):
+			for rel in ("'t0'::regclass", "'t1'::regclass"):
+				node.execute("SELECT %s;" % (check % rel))
 
 	def test_tbl_check_under_eviction(self):
 		self.check_under_eviction(False)
@@ -115,6 +120,16 @@ class TblCheckEvictionTest(BaseTest):
 
 	def verify_sql(self):
 		return "SELECT * FROM verify_orioledb('tw'::regclass);"
+
+	def compression_sql(self):
+		return "SELECT orioledb_tbl_compression_check(5, 'tw'::regclass);"
+
+	def compressed_pages(self, result):
+		# Pages of the primary key the compression check went through.
+		report = result[0][0].split("Compression check for index ")
+		pkey = [r for r in report if r.startswith("tw_pkey")][0]
+		summary = pkey.split("summary:")[1]
+		return sum(int(n) for n in re.findall(r'= (\d+) pages', summary))
 
 	def wait_for(self, what, predicate):
 		deadline = time.time() + WAIT_TIMEOUT
@@ -172,7 +187,7 @@ class TblCheckEvictionTest(BaseTest):
 		reader.close()
 		walker.close()
 
-	def test_parent_merged_during_load_page(self):
+	def parent_merged_during_load_page(self, check_sql):
 		"""The walk must resume where load_page() refound the parent.
 
 		The walk is parked in load_page() of the first leaf of a page while
@@ -190,7 +205,7 @@ class TblCheckEvictionTest(BaseTest):
 		walker_pid = walker.pid
 		node.execute("SELECT pg_stopevent_set('load_page_refind', "
 		             "'$pid == %d && $.level == 0');" % walker_pid)
-		t_walker = ThreadQueryExecutor(walker, self.verify_sql())
+		t_walker = ThreadQueryExecutor(walker, check_sql)
 		t_walker.start()
 		wait_stopevent(node, walker_pid)
 
@@ -203,7 +218,7 @@ class TblCheckEvictionTest(BaseTest):
 		node.execute("CHECKPOINT;")
 		self.assertEqual(node.execute(self.verify_sql()), [])
 
-	def test_parent_evicted_while_unlocked(self):
+	def parent_evicted_while_unlocked(self, check_sql):
 		"""The walk must refind a page that was evicted while unlocked.
 
 		Every time the walk comes back from a leaf, its level 1 page and all
@@ -215,6 +230,7 @@ class TblCheckEvictionTest(BaseTest):
 		"""
 		node = self.node
 		self.start_with_tree()
+		quiet = node.execute(check_sql)
 
 		walker = node.connect()
 		walker_pid = walker.pid
@@ -231,7 +247,7 @@ class TblCheckEvictionTest(BaseTest):
 			    "&& $.walked == true && (%s)');" % (walker_pid, key_cond))
 
 		park_after(0)
-		t_walker = ThreadQueryExecutor(walker, self.verify_sql())
+		t_walker = ThreadQueryExecutor(walker, check_sql)
 		t_walker.start()
 
 		cycles = 0
@@ -247,9 +263,28 @@ class TblCheckEvictionTest(BaseTest):
 			park_after(row if row < ROWS else None)
 
 		node.execute("SELECT pg_stopevent_reset('check_walk_refind');")
-		self.assertEqual(self.join_or_crash(t_walker, "walk"), [])
+		result = self.join_or_crash(t_walker, "walk")
 		walker.close()
 		self.assertGreater(cycles, 150)
+		return quiet, result
+
+	def test_parent_merged_during_load_page(self):
+		self.parent_merged_during_load_page(self.verify_sql())
+
+	def test_compression_parent_merged_during_load_page(self):
+		self.parent_merged_during_load_page(self.compression_sql())
+
+	def test_parent_evicted_while_unlocked(self):
+		quiet, result = self.parent_evicted_while_unlocked(self.verify_sql())
+		self.assertEqual(quiet, [])
+		self.assertEqual(result, [])
+
+	def test_compression_parent_evicted_while_unlocked(self):
+		"""The compression check must go through every page exactly once."""
+		quiet, result = self.parent_evicted_while_unlocked(
+		    self.compression_sql())
+		self.assertEqual(self.compressed_pages(result),
+		                 self.compressed_pages(quiet))
 
 	def test_parent_merged_while_unlocked(self):
 		"""The walk must refind its place after a merge into its page.

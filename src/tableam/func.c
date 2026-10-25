@@ -1449,9 +1449,9 @@ orioledb_tbl_compression_check(PG_FUNCTION_ARGS)
 	/* checks relation arg */
 	orioledb_check_shmem();
 
+	/* Held until the walks end, so the descriptor cannot go away under them. */
 	rel = relation_open(relid, AccessShareLock);
 	descr = relation_get_descr(rel);
-	relation_close(rel, AccessShareLock);
 
 	if (descr == NULL)
 		elog(ERROR, "orioledb relation not found.");
@@ -1567,6 +1567,7 @@ orioledb_tbl_compression_check(PG_FUNCTION_ARGS)
 	}
 
 	pfree(stats.ranges);
+	relation_close(rel, AccessShareLock);
 	PG_RETURN_TEXT_P(cstring_to_text(result.data));
 }
 
